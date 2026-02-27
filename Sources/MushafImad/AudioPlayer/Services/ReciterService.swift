@@ -1,123 +1,119 @@
 import Foundation
-import SwiftUI
 import Combine
 
-/// Central registry that exposes available reciters and persists the selection.
-/// Refactored to be fully modular and injectable.
-@MainActor
 public final class ReciterService: ObservableObject {
-    
-    // 1. خيارات التهيئة (Configuration) مع دعم الـ TimingSource الجديد
     public enum Configuration {
-        case bundled // المصدر الافتراضي
-        case custom(reciters: [ReciterInfo]) // قائمة مخصصة جاهزة
-        case manifest(url: URL) // رابط خارجي لملف JSON
+        case bundled
+        case custom(reciters: [ReciterInfo])
+        case manifest(url: URL)
     }
-
-    /// Lightweight reciter descriptor surfaced to the UI layer.
-    public struct ReciterInfo: Identifiable, Equatable, Codable {
-        public let id: Int
-        public let nameArabic: String
-        public let nameEnglish: String
-        public let rewaya: String
-        public let folderURL: String
-        public let timingSource: TimingSource // إضافة الخاصية الجديدة لضمان التوافق
-
-        public init(
-            id: Int,
-            nameArabic: String,
-            nameEnglish: String,
-            rewaya: String,
-            folderURL: String,
-            timingSource: TimingSource
-        ) {
-            self.id = id
-            self.nameArabic = nameArabic
-            self.nameEnglish = nameEnglish
-            self.rewaya = rewaya
-            self.folderURL = folderURL
-            self.timingSource = timingSource
-        }
-        
-        public var displayName: String {
-            let preferredLanguage: String
-            if #available(macOS 13.0, iOS 16.0, *) {
-                preferredLanguage = Locale.current.language.languageCode?.identifier ?? "en"
-            } else {
-                preferredLanguage = Locale.current.languageCode ?? "en"
-            }
-            return preferredLanguage == "ar" ? nameArabic : nameEnglish
-        }
-        
-        public var audioBaseURL: URL? {
-            URL(string: folderURL)
-        }
-    }
-
+    
     public static let shared = ReciterService()
     
-    @Published public private(set) var availableReciters: [ReciterInfo] = []
-    @Published public var selectedReciter: ReciterInfo? {
-        didSet {
-            if let reciter = selectedReciter {
-                savedReciterId = reciter.id
-            }
-        }
+    @Published public var availableReciters: [ReciterInfo] = []
+    @Published public var selectedReciter: ReciterInfo?
+    @Published public var isLoading: Bool = false
+    
+    private init() {
+        loadReciters(with: .bundled)
     }
     
-    @Published public private(set) var isLoading: Bool = true
-    @AppStorage("selectedReciterId") private var savedReciterId: Int = 0
-    
-    public init(configuration: Configuration = .bundled) {
-        loadReciters(with: configuration)
-    }
-    
-    private func loadReciters(with config: Configuration) {
-        self.isLoading = true
+    public func loadReciters(with config: Configuration) {
+        isLoading = true
         switch config {
         case .bundled:
-            loadAvailableRecitersSync()
+            self.availableReciters = loadAvailableRecitersSync()
+            finalizeSelection()
         case .custom(let reciters):
             self.availableReciters = reciters.sorted { $0.id < $1.id }
             finalizeSelection()
         case .manifest(let url):
-            Task { await loadFromExternalManifest(url: url) }
-        }
-    }
-
-    private async func loadFromExternalManifest(url: URL) {
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            let entries = try JSONDecoder().decode([ReciterManifestEntry].self, from: data)
-            var reciters: [ReciterInfo] = []
-            for entry in entries {
-                if let reciterTiming = AyahTimingService.shared.getReciter(id: entry.id) {
-                    reciters.append(ReciterInfo(
-                        id: reciterTiming.id,
-                        nameArabic: reciterTiming.name,
-                        nameEnglish: reciterTiming.name_en,
-                        rewaya: reciterTiming.rewaya,
-                        folderURL: reciterTiming.folder_url,
-                        timingSource: ReciterDataProvider.timingSource(for: reciterTiming.id)
-                    ))
-                }
+            Task {
+                await loadFromExternalManifest(url: url)
             }
-            self.availableReciters = reciters.sorted { $0.id < $1.id }
-            finalizeSelection()
-        } catch {
-            AppLogger.shared.error("Failed to load external manifest: \(error.localizedDescription)")
-            loadAvailableRecitersSync()
         }
-    }
-
-    private func finalizeSelection() {
-        if savedReciterId > 0, let saved = availableReciters.first(where: { $0.id == savedReciterId }) {
-            self.selectedReciter = saved
-        } else {
-            self.selectedReciter = availableReciters.first
-        }
-        self.isLoading = false
     }
     
-    // تأكد من وجود دالة loadAvailableRecitersSync الأصلية تحت هنا
+    private async func loadFromExternalManifest(url: URL) {
+        // حماية الأمن: رفض الروابط غير المشفرة (HTTP)
+        guard url.scheme?.lowercased() == "https" else {
+            print("[ReciterService] Error: Only HTTPS is allowed for external manifests.")
+            await MainActor.run {
+                self.availableReciters = loadAvailableRecitersSync()
+                finalizeSelection()
+            }
+            return
+        }
+        
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let decoder = JSONDecoder()
+            let manifest = try decoder.decode(ReciterManifest.self, from: data)
+            
+            await MainActor.run {
+                var reciters: [ReciterInfo] = []
+                for entry in manifest.reciters {
+                    // محاولة جلب بيانات القارئ من قاعدة التوقيت المحلية
+                    if let timing = AyahTimingService.shared.getReciter(id: entry.id) {
+                        reciters.append(ReciterInfo(
+                            id: timing.id,
+                            nameArabic: timing.name,
+                            nameEnglish: timing.name_en,
+                            rewaya: timing.rewaya,
+                            folderURL: timing.folder_url
+                        ))
+                    }
+                }
+                
+                // التأكد من أن القائمة ليست فارغة، وإلا نستخدم النسخة الاحتياطية
+                if reciters.isEmpty {
+                    self.availableReciters = loadAvailableRecitersSync()
+                } else {
+                    self.availableReciters = reciters.sorted { $0.id < $1.id }
+                }
+                finalizeSelection()
+            }
+        } catch {
+            await MainActor.run {
+                print("[ReciterService] Failed to load manifest: \(error)")
+                self.availableReciters = loadAvailableRecitersSync()
+                finalizeSelection()
+            }
+        }
+    }
+    
+    // الدالة التي كانت مفقودة وتسببت في الاعتراض
+    private func loadAvailableRecitersSync() -> [ReciterInfo] {
+        guard let url = Bundle.mushafResources.url(forResource: "reciters", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let manifest = try? JSONDecoder().decode(ReciterManifest.self, from: data) else {
+            return [] // ارجاع قائمة فارغة كحماية أخيرة
+        }
+        
+        return manifest.reciters.compactMap { entry in
+            guard let timing = AyahTimingService.shared.getReciter(id: entry.id) else { return nil }
+            return ReciterInfo(
+                id: timing.id,
+                nameArabic: timing.name,
+                nameEnglish: timing.name_en,
+                rewaya: timing.rewaya,
+                folderURL: timing.folder_url
+            )
+        }.sorted { $0.id < $1.id }
+    }
+    
+    private func finalizeSelection() {
+        if selectedReciter == nil {
+            selectedReciter = availableReciters.first
+        }
+        isLoading = false
+    }
+}
+
+// هيكل البيانات المتوقع للمانيفست
+struct ReciterManifest: Codable {
+    struct Entry: Codable {
+        let id: Int
+    }
+    let reciters: [Entry]
 }
