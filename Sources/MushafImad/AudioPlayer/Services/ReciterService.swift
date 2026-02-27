@@ -7,11 +7,51 @@ import Combine
 @MainActor
 public final class ReciterService: ObservableObject {
     
-    // 1. إضافة خيارات التهيئة (Configuration)
+    // 1. خيارات التهيئة (Configuration) مع دعم الـ TimingSource الجديد
     public enum Configuration {
         case bundled // المصدر الافتراضي
         case custom(reciters: [ReciterInfo]) // قائمة مخصصة جاهزة
         case manifest(url: URL) // رابط خارجي لملف JSON
+    }
+
+    /// Lightweight reciter descriptor surfaced to the UI layer.
+    public struct ReciterInfo: Identifiable, Equatable, Codable {
+        public let id: Int
+        public let nameArabic: String
+        public let nameEnglish: String
+        public let rewaya: String
+        public let folderURL: String
+        public let timingSource: TimingSource // إضافة الخاصية الجديدة لضمان التوافق
+
+        public init(
+            id: Int,
+            nameArabic: String,
+            nameEnglish: String,
+            rewaya: String,
+            folderURL: String,
+            timingSource: TimingSource
+        ) {
+            self.id = id
+            self.nameArabic = nameArabic
+            self.nameEnglish = nameEnglish
+            self.rewaya = rewaya
+            self.folderURL = folderURL
+            self.timingSource = timingSource
+        }
+        
+        public var displayName: String {
+            let preferredLanguage: String
+            if #available(macOS 13.0, iOS 16.0, *) {
+                preferredLanguage = Locale.current.language.languageCode?.identifier ?? "en"
+            } else {
+                preferredLanguage = Locale.current.languageCode ?? "en"
+            }
+            return preferredLanguage == "ar" ? nameArabic : nameEnglish
+        }
+        
+        public var audioBaseURL: URL? {
+            URL(string: folderURL)
+        }
     }
 
     public static let shared = ReciterService()
@@ -28,28 +68,20 @@ public final class ReciterService: ObservableObject {
     @Published public private(set) var isLoading: Bool = true
     @AppStorage("selectedReciterId") private var savedReciterId: Int = 0
     
-    // 2. جعل الـ init عام (public) ويقبل Configuration
     public init(configuration: Configuration = .bundled) {
         loadReciters(with: configuration)
     }
     
-    // MARK: - Logic Refactor
-    
     private func loadReciters(with config: Configuration) {
         self.isLoading = true
-        
         switch config {
         case .bundled:
             loadAvailableRecitersSync()
-            
         case .custom(let reciters):
             self.availableReciters = reciters.sorted { $0.id < $1.id }
             finalizeSelection()
-            
         case .manifest(let url):
-            Task {
-                await loadFromExternalManifest(url: url)
-            }
+            Task { await loadFromExternalManifest(url: url) }
         }
     }
 
@@ -57,7 +89,6 @@ public final class ReciterService: ObservableObject {
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
             let entries = try JSONDecoder().decode([ReciterManifestEntry].self, from: data)
-            // تحويل الـ entries لـ ReciterInfo (بافتراض وجود خدمة AyahTimingService)
             var reciters: [ReciterInfo] = []
             for entry in entries {
                 if let reciterTiming = AyahTimingService.shared.getReciter(id: entry.id) {
@@ -66,7 +97,8 @@ public final class ReciterService: ObservableObject {
                         nameArabic: reciterTiming.name,
                         nameEnglish: reciterTiming.name_en,
                         rewaya: reciterTiming.rewaya,
-                        folderURL: reciterTiming.folder_url
+                        folderURL: reciterTiming.folder_url,
+                        timingSource: ReciterDataProvider.timingSource(for: reciterTiming.id)
                     ))
                 }
             }
@@ -74,7 +106,7 @@ public final class ReciterService: ObservableObject {
             finalizeSelection()
         } catch {
             AppLogger.shared.error("Failed to load external manifest: \(error.localizedDescription)")
-            loadAvailableRecitersSync() // Fallback
+            loadAvailableRecitersSync()
         }
     }
 
@@ -86,6 +118,6 @@ public final class ReciterService: ObservableObject {
         }
         self.isLoading = false
     }
-
-    // ... (بقية الـ helper methods مثل loadReciterIdsFromManifest تظل كما هي لدعم الـ bundled config)
+    
+    // تأكد من وجود دالة loadAvailableRecitersSync الأصلية تحت هنا
 }

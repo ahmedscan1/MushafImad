@@ -54,6 +54,11 @@ struct ContentView_iOS: View {
                                 .environmentObject(reciterService)
                                 .environmentObject(toastManager)
                         }
+                        NavigationLink("Audio Player UI with Custom Remote Commands") {
+                            AudioPlayerWithConfigurableCommandsDemo()
+                                .environmentObject(reciterService)
+                                .environmentObject(toastManager)
+                        }
                         NavigationLink("Verse by Verse Playback") {
                             VerseByVerseDemo()
                                 .environmentObject(reciterService)
@@ -264,6 +269,112 @@ private struct AudioPlayerDemo: View {
         }
     }
 }
+
+// MARK: AudioPlayer with Configurable Remote Commands
+/// AudioPlayer with configurable remote commands.
+  private struct AudioPlayerWithConfigurableCommandsDemo: View {
+    @EnvironmentObject private var reciterService: ReciterService
+    @EnvironmentObject private var toastManager: ToastManager
+    @State private var cachedChapter: Chapter?
+    @State private var readerViewModel = MushafView.ViewModel()
+
+    var body: some View {
+      Group {
+        if let chapter = cachedChapter {
+          PlayerViewUI(chapter: chapter, viewModel: readerViewModel)
+            .navigationTitle("Audio Player")
+            .navigationBarTitleDisplayMode(.inline)
+            .environmentObject(reciterService)
+            .environmentObject(toastManager)
+            .task {
+              await readerViewModel.initializePageView(initialPage: chapter.startPage)
+            }
+            .onAppear {
+              Task { @MainActor in
+                var config = LockScreenMetadataManager.RemoteCommandConfig()
+
+                config.onPlayPause = {
+                  Task { @MainActor in
+                    QuranPlayerCoordinator.shared.activePlayer?.togglePlayback()
+                  }
+                }
+                
+                config.onNextTrack = {
+                  Task { @MainActor in
+                    guard let active = QuranPlayerCoordinator.shared.activePlayer,
+                      let reciter = reciterService.selectedReciter,
+                      let baseURL = reciter.audioBaseURL
+                    else { return }
+
+                     if let target = readerViewModel.nextChapter(from: active.chapterNumber) {
+                       active.configureIfNeeded(
+                         baseURL: baseURL,
+                         chapterNumber: target.number,
+                         chapterName: target.displayTitle,
+                         reciterName: reciter.displayName,
+                         reciterId: reciter.id
+                       )
+                       active.startIfNeeded(autoPlay: true)
+                       readerViewModel.navigateToChapterAndPrepareScroll(target)
+                     }
+                  }
+                }
+
+                config.onPreviousTrack = {
+                  Task { @MainActor in
+                    guard let active = QuranPlayerCoordinator.shared.activePlayer,
+                      let reciter = reciterService.selectedReciter,
+                      let baseURL = reciter.audioBaseURL
+                    else { return }
+
+                     if let target = readerViewModel.previousChapter(from: active.chapterNumber) {
+                       active.configureIfNeeded(
+                         baseURL: baseURL,
+                         chapterNumber: target.number,
+                         chapterName: target.displayTitle,
+                         reciterName: reciter.displayName,
+                         reciterId: reciter.id
+                       )
+                       active.startIfNeeded(autoPlay: true)
+                       readerViewModel.navigateToChapterAndPrepareScroll(target)
+                     }
+                  }
+                }
+                
+                  // Note: Adding this action will replace onNextChapter
+               config.onSkipForward = {
+                 Task { @MainActor in
+                   _ = QuranPlayerCoordinator.shared.activePlayer?.seekToNextVerse()
+                 }
+               }
+
+                  // Note: Adding this action will replace onPreviousChapter
+               config.onSkipBackward = {
+                 Task { @MainActor in
+                   _ = QuranPlayerCoordinator.shared.activePlayer?.seekToPreviousVerse()
+                 }
+               }
+
+                LockScreenMetadataManager.shared.setupRemoteCommands(config)
+              }
+            }
+            .onDisappear {
+              Task { @MainActor in
+                LockScreenMetadataManager.shared.clearRemoteCommands()
+              }
+            }
+        } else {
+          ProgressView("Loading chapter data...")
+        }
+      }
+      .task {
+        await readerViewModel.loadData()
+        if cachedChapter == nil {
+          cachedChapter = readerViewModel.chapters.first
+        }
+      }
+    }
+  }
 
 // MARK: Verse by Verse
 private struct VerseByVerseDemo: View {
